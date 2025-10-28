@@ -4,8 +4,9 @@ from flask import Flask, request, jsonify
 from flask_cors import CORS
 
 # ========= 配置（用环境变量覆盖） =========
-MODEL_PATH   = r"C:\Users\13785\OneDrive\Desktop\pdiot_cw3\model\task_1_activity_model_11_class.h5"
+# MODEL_PATH   = r"C:\Users\13785\OneDrive\Desktop\pdiot_cw3\model\task_1_activity_model_11_class.h5"
 # MODEL_PATH   = r"C:\Users\13785\OneDrive\Desktop\pdiot_cw3\model\har_model.h5"
+MODEL_PATH = os.path.join("model", "task_1_activity_model_11_class.h5")
 MODEL_URL    = ""   # 不再从网络下载
 INPUT_WINDOW = int(os.getenv("INPUT_WINDOW", "25"))           # 模型输入时间步
 INPUT_DIM    = int(os.getenv("INPUT_DIM", "3"))                # 通道数（x,y,z）

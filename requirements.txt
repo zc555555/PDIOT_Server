@@ -3,8 +3,8 @@ flask==2.3.2
 flask-cors==4.0.0
 
 # ML and numerical packages
-tensorflow-cpu==2.9.1
-numpy==1.23.5
+tensorflow-cpu==2.20.0
+numpy==1.26.4
 
 # Network requests for model download / debugging
 requests==2.31.0

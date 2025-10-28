@@ -7,12 +7,12 @@ services:
     startCommand: gunicorn app:app
     envVars:
       - key: PYTHON_VERSION
-        value: 3.9.18
+        value: 3.10.13
       - key: NORMALIZE
-        value: "true"
+        value: "false"
       - key: INPUT_WINDOW
-        value: "128"
+        value: "25"
       - key: INPUT_DIM
         value: "3"
       - key: LABELS
-        value: "ascending,descending,lyingBack,lyingLeft,lyingRight,lyingStomach,miscMovement,normalWalking,running,shuffleWalking,sittingStanding"
+        value: "sittingStanding,lyingLeft,lyingRight,lyingBack,lyingStomach,normalWalking,running,ascending,descending,shuffleWalking,miscMovement"

@@ -4,18 +4,34 @@ from flask import Flask, request, jsonify
 from flask_cors import CORS
 
 # ========= 配置（用环境变量覆盖） =========
-# MODEL_PATH   = r"C:\Users\13785\OneDrive\Desktop\pdiot_cw3\model\task_1_activity_model_11_class.h5"
-MODEL_PATH   = r"C:\Users\13785\OneDrive\Desktop\pdiot_cw3\model\har_model.h5"
+MODEL_PATH   = r"C:\Users\13785\OneDrive\Desktop\pdiot_cw3\model\task_1_activity_model_11_class.h5"
+# MODEL_PATH   = r"C:\Users\13785\OneDrive\Desktop\pdiot_cw3\model\har_model.h5"
 MODEL_URL    = ""   # 不再从网络下载
-INPUT_WINDOW = int(os.getenv("INPUT_WINDOW", "128"))           # 模型输入时间步
+INPUT_WINDOW = int(os.getenv("INPUT_WINDOW", "25"))           # 模型输入时间步
 INPUT_DIM    = int(os.getenv("INPUT_DIM", "3"))                # 通道数（x,y,z）
-LABELS = os.getenv(
-    "LABELS",
-    "ascending,descending,lyingBack,lyingLeft,lyingRight,lyingStomach,miscMovement,normalWalking,running,shuffleWalking,sittingStanding"
-).split(",")
+# LABELS = os.getenv(
+#     "LABELS",
+#     "ascending,descending,lyingBack,lyingLeft,lyingRight,lyingStomach,miscMovement,normalWalking,running,shuffleWalking,sittingStanding"
+# ).split(",")
+
+LABELS = [
+    "sittingStanding",
+    "lyingLeft",
+    "lyingRight",
+    "lyingBack",
+    "lyingStomach",
+    "normalWalking",
+    "running",
+    "ascending",
+    "descending",
+    "shuffleWalking",
+    "miscMovement"
+]
+
 
 THRESH_PAD   = int(os.getenv("THRESH_PAD", "0"))               # 可选前置丢帧
-NORMALIZE = os.getenv("NORMALIZE", "true").lower() == "true"
+# NORMALIZE = os.getenv("NORMALIZE", "true").lower() == "true"
+NORMALIZE = os.getenv("NORMALIZE", "true").lower() == "false"
 
 
 app = Flask(__name__)
@@ -71,6 +87,34 @@ def load_model_once() -> Tuple[str, str]:
         app.logger.exception(f"Load model failed: {e}")
         return "error", _loaded_from
 
+# def load_model_once() -> Tuple[str, str]:
+#     global _model, _loaded_from
+#     if _model is not None:
+#         return "ok", _loaded_from
+#
+#     model_path = MODEL_PATH
+#     if not os.path.exists(model_path):
+#         return "missing", "none"
+#
+#     from tensorflow.keras.models import load_model
+#     try:
+#         # ✅ 优先尝试新版Keras加载
+#         _model = load_model(model_path, compile=False)
+#         _loaded_from = "local"
+#         return "ok", _loaded_from
+#     except Exception as e1:
+#         app.logger.warning(f"Primary load failed: {e1}, retrying with safe_mode=False ...")
+#         try:
+#             # ✅ 尝试兼容模式加载（旧版模型）
+#             _model = load_model(model_path, compile=False, safe_mode=False)
+#             _loaded_from = "compat"
+#             return "ok", _loaded_from
+#         except Exception as e2:
+#             app.logger.exception(f"Both load attempts failed: {e2}")
+#             return "error", "local"
+
+
+
 # ========= JSON 解析（兼容三类格式）=========
 def parse_acc_data(payload: Dict[str, Any]) -> List[List[float]]:
     # A) {"acc": [[x,y,z], ...]}
@@ -105,11 +149,11 @@ def prepare_window(acc_xyz: List[List[float]]) -> "np.ndarray":
         pad = np.zeros((INPUT_WINDOW - arr.shape[0], INPUT_DIM), dtype="float32")
         arr = np.vstack([pad, arr])
 
-    if NORMALIZE:
-        # 简单标准化：逐通道零均值单位方差（避免除零）
-        mean = arr.mean(axis=0, keepdims=True)
-        std  = arr.std(axis=0, keepdims=True) + 1e-6
-        arr  = (arr - mean) / std
+    # if NORMALIZE:
+    #     # 简单标准化：逐通道零均值单位方差（避免除零）
+    #     mean = arr.mean(axis=0, keepdims=True)
+    #     std  = arr.std(axis=0, keepdims=True) + 1e-6
+    #     arr  = (arr - mean) / std
 
     arr = arr.reshape(1, INPUT_WINDOW, INPUT_DIM)
     return arr

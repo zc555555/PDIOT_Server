@@ -2,6 +2,13 @@ import os, time, json, hashlib, pathlib, tempfile
 from typing import List, Dict, Any, Tuple
 from flask import Flask, request, jsonify
 from flask_cors import CORS
+import logging
+
+# 强制 Flask 输出所有 INFO 日志到 stdout（Render 能捕获）
+logging.basicConfig(
+    level=logging.INFO,
+    format='[%(asctime)s] %(levelname)s: %(message)s'
+)
 
 # ========= 配置（用环境变量覆盖） =========
 # MODEL_PATH   = r"C:\Users\13785\OneDrive\Desktop\pdiot_cw3\model\task_1_activity_model_11_class.h5"

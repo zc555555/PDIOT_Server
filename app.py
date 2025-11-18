@@ -12,11 +12,28 @@ logging.basicConfig(
 )
 
 # ========= 模型1配置：daily activity =========
-MODEL_PATH = os.path.join("model", "human_activity.h5")   # ⭐ 新的活动模型
+# 使用你最新训练的 11-class 模型 (TIMESTEPS = 50)
+MODEL_PATH = os.path.join("model", "task_1_activity_model_11_class.h5")
 MODEL_URL    = ""
-INPUT_WINDOW = int(os.getenv("INPUT_WINDOW", "25"))
+
+# ⭐ 窗口长度改成 50，和训练脚本 TIMESTEPS = 50 一致
+INPUT_WINDOW = int(os.getenv("INPUT_WINDOW", "50"))
 INPUT_DIM    = int(os.getenv("INPUT_DIM", "3"))
 
+# ⭐ 标签顺序必须和训练脚本 CLASSES_MAP 完全一致
+# CLASSES_MAP = {
+#     "sittingStanding": 0,
+#     "lyingLeft": 1,
+#     "lyingRight": 2,
+#     "lyingBack": 3,
+#     "lyingStomach": 4,
+#     "normalWalking": 5,
+#     "running": 6,
+#     "ascending": 7,
+#     "descending": 8,
+#     "shuffleWalking": 9,
+#     "miscMovement": 10
+# }
 LABELS = [
     "sittingStanding",
     "lyingLeft",
@@ -31,7 +48,10 @@ LABELS = [
     "miscMovement"
 ]
 
-# static 状态，只在这些状态下跑 social signal 模型
+# 方便做后处理：名字 -> index
+ACTIVITY_MAP = {name: idx for idx, name in enumerate(LABELS)}
+
+# static 状态，只在这些状态下跑 social signal 模型（名字不变）
 STATIC_ACTIVITIES = {
     "sittingStanding",
     "lyingLeft",
@@ -80,7 +100,7 @@ _loaded_from = None
 
 def load_model_once() -> Tuple[str, str]:
     """
-    加载 daily activity 模型（human_activity.h5）
+    加载 daily activity 模型（task_1_activity_model_11_class.h5）
     """
     global _model, _loaded_from
     if _model is not None:
@@ -102,8 +122,6 @@ def load_model_once() -> Tuple[str, str]:
         return "missing", _loaded_from
 
     try:
-        # from tensorflow.keras.models import load_model
-        # _model = load_model(model_path, compile=False)
         _model = tf.keras.models.load_model(model_path, compile=False)
         return "ok", _loaded_from
     except Exception as e:
@@ -139,9 +157,6 @@ def load_social_model_once() -> Tuple[str, str]:
         return "missing", _social_loaded_from
 
     try:
-        # from tensorflow.keras.models import load_model
-        # _social_model = load_model(model_path, compile=False)
-
         _social_model = tf.keras.models.load_model(model_path, compile=False)
 
         # 检查输出维度是否和 4 类一致
@@ -180,7 +195,8 @@ def parse_acc_data(payload: Dict[str, Any]) -> List[List[float]]:
 # ========= 窗口准备 =========
 def prepare_window_activity(acc_xyz: List[List[float]]) -> "np.ndarray":
     """
-    给 daily activity 模型用的窗口（25x3）
+    给 daily activity 模型用的窗口（50x3）
+    前端可以传 N>=50 的序列，后端会取最后 50 个点；不够会在前面补 0
     """
     import numpy as np
     arr = np.array(acc_xyz, dtype="float32")
@@ -216,18 +232,89 @@ def prepare_window_social(acc_xyz: List[List[float]]) -> "np.ndarray":
     arr = arr.reshape(1, SOCIAL_INPUT_WINDOW, SOCIAL_INPUT_DIM)
     return arr
 
+# ========= daily activity 概率后处理（来自 test.ipynb） =========
+def _postprocess_activity_probs(probs_raw: "np.ndarray") -> Tuple[int, float]:
+    """
+    对单个窗口的 11 维概率做：
+    1) alpha 重权
+    2) 规则修正 (ascending vs normal, sitting/descending vs shuffle, shuffle vs misc)
+    返回: (final_idx, final_conf)
+    """
+    import numpy as np
+
+    num_classes = len(LABELS)
+    probs = probs_raw.astype("float32")
+
+    # ------- 2.1 alpha 重权 -------
+    alpha = np.ones(num_classes, dtype=np.float32)
+
+    sitting_idx    = ACTIVITY_MAP["sittingStanding"]
+    normal_idx     = ACTIVITY_MAP["normalWalking"]
+    shuffle_idx    = ACTIVITY_MAP["shuffleWalking"]
+    misc_idx       = ACTIVITY_MAP["miscMovement"]
+    ascending_idx  = ACTIVITY_MAP["ascending"]
+    descending_idx = ACTIVITY_MAP["descending"]
+
+    # 压一些 dominating 类
+    alpha[sitting_idx]    = 0.80
+    alpha[ascending_idx]  = 0.90
+    alpha[descending_idx] = 0.90
+
+    # 抬高 hard 类
+    alpha[normal_idx]  = 1.10
+    alpha[shuffle_idx] = 1.30
+    alpha[misc_idx]    = 1.10
+
+    probs_scaled = probs * alpha
+    probs_scaled = probs_scaled / (probs_scaled.sum() + 1e-8)
+
+    # 初始预测
+    pred = int(np.argmax(probs_scaled))
+
+    # ------- 2.2 规则式后处理 -------
+    margin_asc_norm    = 0.10
+    margin_shuffle_cut = 0.10
+
+    p_norm    = float(probs_scaled[normal_idx])
+    p_asc     = float(probs_scaled[ascending_idx])
+    p_shuffle = float(probs_scaled[shuffle_idx])
+    p_sit     = float(probs_scaled[sitting_idx])
+    p_misc    = float(probs_scaled[misc_idx])
+    p_desc    = float(probs_scaled[descending_idx])
+
+    # 1) ascending vs normalWalking 修正
+    if pred == ascending_idx and (p_asc - p_norm) < margin_asc_norm:
+        pred = normal_idx
+
+    # 2) sitting → shuffle
+    if pred == sitting_idx and (p_shuffle - p_sit) > -margin_shuffle_cut:
+        pred = shuffle_idx
+
+    # 3) descending → shuffle
+    if pred == descending_idx and (p_shuffle - p_desc) > -margin_shuffle_cut:
+        pred = shuffle_idx
+
+    # 4) shuffle → misc
+    if pred == shuffle_idx and (p_misc - p_shuffle) > margin_shuffle_cut:
+        pred = misc_idx
+
+    # 最终置信度就取后处理后的 probs_scaled[pred]
+    final_conf = float(probs_scaled[pred])
+    return pred, final_conf
+
 # ========= 推理 =========
 def infer_label(arr: "np.ndarray") -> Tuple[str, float, int]:
     """
-    daily activity 推理
+    daily activity 推理（用 task_1_activity_model_11_class.h5 + alpha/规则后处理）
     """
     import numpy as np
     status, source = load_model_once()
     if status != "ok":
         return "ModelNotReady", 0.0, -1
-    probs = _model.predict(arr, verbose=0)[0]
-    idx = int(np.argmax(probs))
-    conf = float(probs[idx])
+
+    probs = _model.predict(arr, verbose=0)[0]  # shape (11,)
+    idx, conf = _postprocess_activity_probs(probs)
+
     label = LABELS[idx] if 0 <= idx < len(LABELS) else f"class_{idx}"
     return label, conf, idx
 
@@ -307,12 +394,17 @@ def schema():
 
 @app.route("/classify", methods=["POST"])
 def classify():
+    """
+    综合接口：先做 daily activity，如果是静态类，再做 social signal。
+    期望 acc 形状为 [N, 3]，N >= 50（不足会补零）。
+    """
     t0 = time.time()
     try:
         payload = request.get_json(force=True, silent=False)
         acc = parse_acc_data(payload)
 
-        if not acc or not isinstance(acc, list) or not isinstance(acc[0], list) or len(acc[0]) != INPUT_DIM:
+        if (not acc or not isinstance(acc, list) or
+                not isinstance(acc[0], list) or len(acc[0]) != INPUT_DIM):
             app.logger.error(f"[ERROR] Bad JSON payload: {str(payload)[:200]} ...")
             return jsonify({
                 "ok": False,
@@ -352,7 +444,7 @@ def classify():
         app.logger.info(
             f"[INFO] Received window: {len(acc):3d} samples | "
             f"mean magnitude: {mean_magnitude:.3f} | "
-            f"activity: {activity_label:10s} | conf: {activity_conf:.2f} | "
+            f"activity: {activity_label:15s} | conf: {activity_conf:.2f} | "
             f"latency: {latency_ms} ms"
         )
 
@@ -420,7 +512,7 @@ def log_activity():
         # ========== 累积逻辑 ==========
         day_hist = user_hist.setdefault(date_str, defaultdict(float))
 
-        # 每窗口 2 秒（根据采样率12.5Hz、窗口25）
+        # 每窗口的时间长度 = INPUT_WINDOW / 12.5
         WINDOW_DURATION = INPUT_WINDOW / 12.5
         if "cough" in activity.lower():
             day_hist[activity] = round(day_hist.get(activity, 0.0) + 1, 2)
@@ -454,15 +546,16 @@ def get_history(user, date):
 @app.route("/classify_activity", methods=["POST"])
 def classify_activity():
     """
-    只做 daily activity 分类，输入窗口为 25x3
-    前端可以直接传 25x3，也可以更长，后端会取最后 25 个点，不够则补零
+    只做 daily activity 分类，输入窗口为 50x3
+    前端可以直接传 N>=50 个样本，后端会取最后 50 个点，不够则补 0。
     """
     t0 = time.time()
     try:
         payload = request.get_json(force=True, silent=False)
         acc = parse_acc_data(payload)
 
-        if not acc or not isinstance(acc, list) or not isinstance(acc[0], list) or len(acc[0]) != INPUT_DIM:
+        if (not acc or not isinstance(acc, list) or
+                not isinstance(acc[0], list) or len(acc[0]) != INPUT_DIM):
             app.logger.error(f"[ERROR] Bad JSON payload (activity): {str(payload)[:200]} ...")
             return jsonify({
                 "ok": False,
@@ -511,7 +604,8 @@ def classify_social():
         acc = parse_acc_data(payload)
         activity_from_frontend = payload.get("activity")  # 可选
 
-        if not acc or not isinstance(acc, list) or not isinstance(acc[0], list) or len(acc[0]) != SOCIAL_INPUT_DIM:
+        if (not acc or not isinstance(acc, list) or
+                not isinstance(acc[0], list) or len(acc[0]) != SOCIAL_INPUT_DIM):
             app.logger.error(f"[ERROR] Bad JSON payload (social): {str(payload)[:200]} ...")
             return jsonify({
                 "ok": False,
@@ -549,7 +643,6 @@ def classify_social():
     except Exception as e:
         app.logger.exception(f"[EXCEPTION] classify_social() failed: {e}")
         return jsonify({"ok": False, "error": str(e)}), 500
-
 
 
 # ========= 程序入口 =========

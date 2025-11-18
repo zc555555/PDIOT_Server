@@ -4,42 +4,38 @@ from flask import Flask, request, jsonify
 from flask_cors import CORS
 import logging
 import tensorflow as tf
-from collections import defaultdict, deque  # ⭐ 新增 deque，用于滚动窗口缓冲
+from collections import defaultdict, deque
 
-# ========= 日志配置 =========
 logging.basicConfig(
     level=logging.INFO,
     format='[%(asctime)s] %(levelname)s: %(message)s'
 )
 
-# ========= 模型1配置：daily activity =========
-# 使用你最新训练的 11-class 模型 (TIMESTEPS = 50)
-MODEL_PATH = os.path.join("model", "task_1_activity_model_11_class.h5")
-MODEL_URL    = ""
+# ========= 模型1配置：daily activity（新 HAR 模型） =========
+MODEL_PATH = os.path.join("model", "har_model.h5")  # ⭐ 使用新模型 har_model.h5
+MODEL_URL = ""
 
-# ⭐ 窗口长度 50，和训练脚本 TIMESTEPS = 50 一致
+# har_model 使用的窗口：50 个采样点，每个 3 轴加速度
 INPUT_WINDOW = int(os.getenv("INPUT_WINDOW", "50"))
-INPUT_DIM    = int(os.getenv("INPUT_DIM", "3"))
+INPUT_DIM = int(os.getenv("INPUT_DIM", "3"))
 
-# ⭐ 标签顺序必须和训练脚本 CLASSES_MAP 完全一致
+# ⭐ 标签顺序必须和 train_har_model.py 中 TASK_CONFIGS['activity']['class_names'] 完全一致
 LABELS = [
-    "sittingStanding",
-    "lyingLeft",
-    "lyingRight",
-    "lyingBack",
-    "lyingStomach",
-    "normalWalking",
-    "running",
     "ascending",
     "descending",
+    "lyingBack",
+    "lyingLeft",
+    "lyingRight",
+    "lyingStomach",
+    "miscMovement",
+    "normalWalking",
+    "running",
     "shuffleWalking",
-    "miscMovement"
+    "sittingStanding"
 ]
 
-# 方便做后处理：名字 -> index
 ACTIVITY_MAP = {name: idx for idx, name in enumerate(LABELS)}
 
-# static 状态，只在这些状态下跑 social signal 模型
 STATIC_ACTIVITIES = {
     "sittingStanding",
     "lyingLeft",
@@ -48,10 +44,9 @@ STATIC_ACTIVITIES = {
     "lyingStomach"
 }
 
-THRESH_PAD   = int(os.getenv("THRESH_PAD", "0"))
-NORMALIZE = os.getenv("NORMALIZE", "true").lower() == "false"  # 保留原逻辑
+THRESH_PAD = int(os.getenv("THRESH_PAD", "0"))
 
-# ========= 模型2配置：social signal =========
+# ========= 模型2配置：social signal（保持不变） =========
 SOCIAL_MODEL_PATH = os.path.join("model", "social_signal_cnn_lstm.h5")
 SOCIAL_MODEL_URL = ""
 SOCIAL_INPUT_WINDOW = int(os.getenv("SOCIAL_INPUT_WINDOW", "50"))
@@ -64,15 +59,12 @@ SOCIAL_CLASS_NAMES = [
     "other"
 ]
 
-# 训练时使用的 mean / std（直接硬编码到服务端，保证和训练一致）
 SOCIAL_NORM_MEAN = [-0.07304631, -0.3672524, 0.06649867]
-SOCIAL_NORM_STD  = [0.5281695, 0.44663346, 0.6301666]
+SOCIAL_NORM_STD = [0.5281695, 0.44663346, 0.6301666]
 
-# ========= 全局缓冲：用于在线滚动窗口 =========
-# ⭐ 关键：服务器端维护最近 50 个样本，保证送入模型的是“连续 50 点”
+# ========= 全局缓冲：用于 online 滑动窗口 =========
 ACC_BUFFER = deque(maxlen=INPUT_WINDOW)
 
-# ========= Flask 应用初始化 =========
 app = Flask(__name__)
 CORS(app)
 
@@ -86,14 +78,11 @@ def _download_to(path: str, url: str) -> str:
         f.write(r.content)
     return path
 
-# ========= 模型1加载（daily activity） =========
+# ========= 模型1加载（daily activity：har_model.h5） =========
 _model = None
 _loaded_from = None
 
 def load_model_once() -> Tuple[str, str]:
-    """
-    加载 daily activity 模型（task_1_activity_model_11_class.h5）
-    """
     global _model, _loaded_from
     if _model is not None:
         return "ok", _loaded_from
@@ -126,9 +115,6 @@ _social_loaded_from = None
 _social_labels = None
 
 def load_social_model_once() -> Tuple[str, str]:
-    """
-    加载 social signal 模型（social_signal_cnn_lstm.h5）
-    """
     global _social_model, _social_loaded_from, _social_labels
     if _social_model is not None:
         return "ok", _social_loaded_from
@@ -151,7 +137,6 @@ def load_social_model_once() -> Tuple[str, str]:
     try:
         _social_model = tf.keras.models.load_model(model_path, compile=False)
 
-        # 检查输出维度是否和 4 类一致
         try:
             n_classes = _social_model.output_shape[-1]
             if n_classes != len(SOCIAL_CLASS_NAMES):
@@ -168,55 +153,112 @@ def load_social_model_once() -> Tuple[str, str]:
         app.logger.exception(f"Load social model failed: {e}")
         return "error", _social_loaded_from
 
-# ========= 数据解析 =========
+# ========= JSON 数据解析 =========
 def parse_acc_data(payload: Dict[str, Any]) -> List[List[float]]:
     if isinstance(payload, dict) and "acc" in payload and isinstance(payload["acc"], list):
         return payload["acc"]
-    if isinstance(payload, dict) and all(k in payload for k in ("x","y","z")):
+    if isinstance(payload, dict) and all(k in payload for k in ("x", "y", "z")):
         xs, ys, zs = payload["x"], payload["y"], payload["z"]
         if len(xs) == len(ys) == len(zs) and len(xs) > 0:
             return [[float(xs[i]), float(ys[i]), float(zs[i])] for i in range(len(xs))]
     if isinstance(payload, dict) and "samples" in payload and isinstance(payload["samples"], list):
         out = []
         for s in payload["samples"]:
-            if all(k in s for k in ("x","y","z")):
+            if all(k in s for k in ("x", "y", "z")):
                 out.append([float(s["x"]), float(s["y"]), float(s["z"])])
         return out
     return []
 
-# ========= 窗口准备 =========
+# ========= HAR 预处理（必须和 train_har_model.py 一致） =========
+def _normalize_windows_for_har(windows: "np.ndarray") -> "np.ndarray":
+    """
+    将加速度按 ±2g 缩放到 [-1, 1]，保留重力方向（和训练脚本 normalize_windows 一致）
+    windows: (N, 50, 3)
+    """
+    import numpy as np
+    normalized = windows / 2.0
+    normalized = np.clip(normalized, -1.0, 1.0)
+    return normalized.astype("float32")
+
+def _add_fft_features_for_har(X: "np.ndarray") -> "np.ndarray":
+    """
+    为每个通道增加 FFT 频域特征，输出形状 (N, 50, 6)
+    逻辑和 train_har_model.py 中 add_fft_features 完全一致
+    """
+    import numpy as np
+    n_samples, window_size, n_channels = X.shape
+    X_enhanced = np.zeros((n_samples, window_size, n_channels * 2), dtype="float32")
+
+    for i in range(n_samples):
+        X_enhanced[i, :, :n_channels] = X[i]
+        for ch in range(n_channels):
+            fft_vals = np.fft.rfft(X[i, :, ch])
+            fft_magnitude = np.abs(fft_vals)
+            fft_magnitude = fft_magnitude / (np.max(fft_magnitude) + 1e-8)
+
+            fft_interp = np.interp(
+                np.linspace(0, len(fft_magnitude) - 1, window_size),
+                np.arange(len(fft_magnitude)),
+                fft_magnitude
+            )
+            X_enhanced[i, :, n_channels + ch] = fft_interp.astype("float32")
+    return X_enhanced
+
+def _add_physical_features_for_har(X: "np.ndarray") -> "np.ndarray":
+    """
+    基于前三个通道的加速度，增加：
+    - magnitude: ||a||
+    - direction cosines: x/||a||, y/||a||, z/||a||
+    输出形状：原通道数 + 4（变成 10 通道）
+    """
+    import numpy as np
+    accel = X[:, :, :3]
+    mag = np.sqrt(np.sum(accel ** 2, axis=2, keepdims=True))
+    ratio = accel / (mag + 1e-8)
+    X_enhanced = np.concatenate([X, mag, ratio], axis=2)
+    return X_enhanced.astype("float32")
+
+# ========= 窗口准备（供 har_model 使用） =========
 def prepare_window_activity(acc_xyz: List[List[float]]) -> "np.ndarray":
     """
-    给 daily activity 模型用的窗口（50x3）
-    这里假定 acc_xyz 已经是“尽可能长的连续序列”，会取最后 50 个点，不够前面补 0。
+    服务器端完成和训练脚本等价的预处理：
+    1. 从全局 ACC_BUFFER 取最近 50 个三轴加速度
+    2. /2.0 并 clip 到 [-1,1]
+    3. 加 FFT 特征 => 6 通道
+    4. 加物理特征（模长 + 方向 cos） => 10 通道
+    最终形状： (1, 50, 10)，和 har_model.h5 的输入完全对齐
     """
     import numpy as np
     arr = np.array(acc_xyz, dtype="float32")
+
     if THRESH_PAD > 0 and arr.shape[0] > THRESH_PAD:
         arr = arr[THRESH_PAD:, :]
+
     if arr.shape[0] >= INPUT_WINDOW:
         arr = arr[-INPUT_WINDOW:, :]
     else:
         pad = np.zeros((INPUT_WINDOW - arr.shape[0], INPUT_DIM), dtype="float32")
         arr = np.vstack([pad, arr])
+
     arr = arr.reshape(1, INPUT_WINDOW, INPUT_DIM)
+
+    arr = _normalize_windows_for_har(arr)
+    arr = _add_fft_features_for_har(arr)      # (1, 50, 6)
+    arr = _add_physical_features_for_har(arr) # (1, 50, 10)
+
     return arr
 
+# ========= social 模型窗口准备 =========
 def prepare_window_social(acc_xyz: List[List[float]]) -> "np.ndarray":
-    """
-    给 social signal 模型用的窗口（50x3）+ 标准化（用训练时的 mean/std）
-    """
     import numpy as np
     arr = np.array(acc_xyz, dtype="float32")
 
-    # 截/补成 50x3
     if arr.shape[0] >= SOCIAL_INPUT_WINDOW:
         arr = arr[-SOCIAL_INPUT_WINDOW:, :]
     else:
         pad = np.zeros((SOCIAL_INPUT_WINDOW - arr.shape[0], SOCIAL_INPUT_DIM), dtype="float32")
         arr = np.vstack([pad, arr])
 
-    # 用训练的 mean / std 做 z-score 标准化
     mean = np.array(SOCIAL_NORM_MEAN, dtype="float32")
     std = np.array(SOCIAL_NORM_STD, dtype="float32")
     arr = (arr - mean) / (std + 1e-8)
@@ -224,14 +266,8 @@ def prepare_window_social(acc_xyz: List[List[float]]) -> "np.ndarray":
     arr = arr.reshape(1, SOCIAL_INPUT_WINDOW, SOCIAL_INPUT_DIM)
     return arr
 
-# ========= daily activity 概率后处理（与你的 test 脚本一致） =========
+# ========= daily activity 概率后处理 =========
 def _postprocess_activity_probs(probs_raw: "np.ndarray") -> Tuple[int, float]:
-    """
-    对单个窗口的 11 维概率做：
-    1) alpha 重权
-    2) 规则修正 (ascending vs normal, sitting/descending vs shuffle, shuffle vs misc)
-    返回: (final_idx, final_conf)
-    """
     import numpy as np
 
     num_classes = len(LABELS)
@@ -246,12 +282,10 @@ def _postprocess_activity_probs(probs_raw: "np.ndarray") -> Tuple[int, float]:
     ascending_idx  = ACTIVITY_MAP["ascending"]
     descending_idx = ACTIVITY_MAP["descending"]
 
-    # 压一些 dominating 类
     alpha[sitting_idx]    = 0.80
     alpha[ascending_idx]  = 0.90
     alpha[descending_idx] = 0.90
 
-    # 抬高 hard 类
     alpha[normal_idx]  = 1.10
     alpha[shuffle_idx] = 1.30
     alpha[misc_idx]    = 1.10
@@ -271,19 +305,15 @@ def _postprocess_activity_probs(probs_raw: "np.ndarray") -> Tuple[int, float]:
     p_misc    = float(probs_scaled[misc_idx])
     p_desc    = float(probs_scaled[descending_idx])
 
-    # 1) ascending vs normalWalking 修正
     if pred == ascending_idx and (p_asc - p_norm) < margin_asc_norm:
         pred = normal_idx
 
-    # 2) sitting → shuffle
     if pred == sitting_idx and (p_shuffle - p_sit) > -margin_shuffle_cut:
         pred = shuffle_idx
 
-    # 3) descending → shuffle
     if pred == descending_idx and (p_shuffle - p_desc) > -margin_shuffle_cut:
         pred = shuffle_idx
 
-    # 4) shuffle → misc
     if pred == shuffle_idx and (p_misc - p_shuffle) > margin_shuffle_cut:
         pred = misc_idx
 
@@ -292,24 +322,17 @@ def _postprocess_activity_probs(probs_raw: "np.ndarray") -> Tuple[int, float]:
 
 # ========= 推理 =========
 def infer_label(arr: "np.ndarray") -> Tuple[str, float, int]:
-    """
-    daily activity 推理（用 task_1_activity_model_11_class.h5 + alpha/规则后处理）
-    """
     import numpy as np
     status, source = load_model_once()
     if status != "ok":
         return "ModelNotReady", 0.0, -1
 
-    probs = _model.predict(arr, verbose=0)[0]  # shape (11,)
+    probs = _model.predict(arr, verbose=0)[0]
     idx, conf = _postprocess_activity_probs(probs)
-
     label = LABELS[idx] if 0 <= idx < len(LABELS) else f"class_{idx}"
     return label, conf, idx
 
 def infer_social_label(arr: "np.ndarray") -> Tuple[str, float, int]:
-    """
-    social signal 推理
-    """
     import numpy as np
     status, source = load_social_model_once()
     if status != "ok":
@@ -328,7 +351,7 @@ def infer_social_label(arr: "np.ndarray") -> Tuple[str, float, int]:
 # ========= API 路由 =========
 @app.route("/", methods=["GET"])
 def home():
-    return "PDIoT Cloud API (model mode)", 200
+    return "PDIoT Cloud API (har_model)", 200
 
 @app.route("/health", methods=["GET"])
 def health():
@@ -342,7 +365,7 @@ def health():
             "source": source1,
             "model_path": MODEL_PATH,
             "input_window": INPUT_WINDOW,
-            "input_dim": INPUT_DIM,
+            "raw_input_dim": INPUT_DIM,
             "labels": LABELS,
         },
         "social_model": {
@@ -369,7 +392,7 @@ def schema():
         },
         "activity_model": {
             "input_window": INPUT_WINDOW,
-            "input_dim": INPUT_DIM,
+            "raw_input_dim": INPUT_DIM,
             "labels": LABELS
         },
         "social_model": {
@@ -382,10 +405,6 @@ def schema():
 
 @app.route("/classify", methods=["POST"])
 def classify():
-    """
-    综合接口：先做 daily activity，如果是静态类，再做 social signal。
-    期望 acc 形状为 [N, 3]，前端可以每次发一小段，后端会累积到 50 个样本。
-    """
     t0 = time.time()
     try:
         payload = request.get_json(force=True, silent=False)
@@ -401,7 +420,6 @@ def classify():
 
         import numpy as np
 
-        # ⭐ 关键：累积到全局 ACC_BUFFER，保证用连续 50 点预测
         for s in acc:
             ACC_BUFFER.append(s)
 
@@ -410,10 +428,9 @@ def classify():
         activity_label, activity_conf, activity_idx = infer_label(arr_activity)
         latency_ms = int((time.time() - t0) * 1000)
 
-        acc_np = np.array(acc)
-        mean_magnitude = float(np.mean(np.sqrt(np.sum(acc_np**2, axis=1))))
+        acc_np = np.array(acc, dtype="float32")
+        mean_magnitude = float(np.mean(np.sqrt(np.sum(acc_np ** 2, axis=1))))
 
-        # ===== 2. 若是 static 状态，再跑 social signal（仍使用本次 acc） =====
         social_result = None
         if activity_label in STATIC_ACTIVITIES:
             arr_social = prepare_window_social(acc)
@@ -458,10 +475,8 @@ def classify():
         app.logger.exception(f"[EXCEPTION] classify() failed: {e}")
         return jsonify({"ok": False, "error": str(e)}), 500
 
-# ==========================
-# 活动日志模块（原样保留）
-# ==========================
-DATA_FILE = "activity_history.json"  # 日志存储路径
+# ========= 活动日志模块 =========
+DATA_FILE = "activity_history.json"
 
 def load_history() -> dict:
     if os.path.exists(DATA_FILE):
@@ -478,10 +493,6 @@ def save_history(data: dict):
 
 @app.route("/log_activity", methods=["POST"])
 def log_activity():
-    """
-    前端每次分类后调用此接口保存活动记录。
-    当天累积；若进入新日期，则自动重置。
-    """
     try:
         payload = request.get_json(force=True)
         user_id = payload.get("user_id", "anonymous")
@@ -490,26 +501,21 @@ def log_activity():
         ts = int(payload.get("timestamp", time.time()))
         date_str = time.strftime("%Y-%m-%d", time.localtime(ts))
 
-        # ========== 加载历史 ==========
         history = load_history()
         user_hist = history.setdefault(user_id, {})
 
-        # ✅ 如果已有记录，但不是今天的，自动清零
         if user_hist and date_str not in user_hist:
             app.logger.info(f"[RESET] New day detected for {user_id}. Clearing old history.")
             user_hist.clear()
 
-        # ========== 累积逻辑 ==========
         day_hist = user_hist.setdefault(date_str, defaultdict(float))
 
-        # 每窗口的时间长度 = INPUT_WINDOW / 12.5
         WINDOW_DURATION = INPUT_WINDOW / 12.5
         if "cough" in activity.lower():
             day_hist[activity] = round(day_hist.get(activity, 0.0) + 1, 2)
         else:
             day_hist[activity] = round(day_hist.get(activity, 0.0) + WINDOW_DURATION, 2)
 
-        # 保存结果
         history[user_id][date_str] = dict(day_hist)
         save_history(history)
 
@@ -522,10 +528,6 @@ def log_activity():
 
 @app.route("/history/<user>/<date>", methods=["GET"])
 def get_history(user, date):
-    """
-    返回某用户在某日的活动统计。
-    例如 GET /history/user1/2025-11-04
-    """
     history = load_history()
     user_hist = history.get(user, {})
     result = user_hist.get(date, {})
@@ -533,10 +535,6 @@ def get_history(user, date):
 
 @app.route("/classify_activity", methods=["POST"])
 def classify_activity():
-    """
-    只做 daily activity 分类。
-    前端可以每次发 N 个样本（例如 25），后端会累积到 50 个，送入模型。
-    """
     t0 = time.time()
     try:
         payload = request.get_json(force=True, silent=False)
@@ -552,7 +550,6 @@ def classify_activity():
 
         import numpy as np
 
-        # ⭐ 同样累积到 ACC_BUFFER
         for s in acc:
             ACC_BUFFER.append(s)
 
@@ -561,8 +558,8 @@ def classify_activity():
         label, conf, idx = infer_label(arr)
         latency_ms = int((time.time() - t0) * 1000)
 
-        acc_np = np.array(acc)
-        mean_magnitude = float(np.mean(np.sqrt(np.sum(acc_np**2, axis=1))))
+        acc_np = np.array(acc, dtype="float32")
+        mean_magnitude = float(np.mean(np.sqrt(np.sum(acc_np ** 2, axis=1))))
 
         app.logger.info(
             f"[ACTIVITY] samples={len(acc):3d} | buffer_len={buffer_len:3d} | "
@@ -587,16 +584,11 @@ def classify_activity():
 
 @app.route("/classify_social", methods=["POST"])
 def classify_social():
-    """
-    只做 social signal 分类，输入窗口为 50x3
-    默认前端只在 static activity (sitting / lying*) 时调用。
-    可选参数: activity，用来做一个简单校验。
-    """
     t0 = time.time()
     try:
         payload = request.get_json(force=True, silent=False)
         acc = parse_acc_data(payload)
-        activity_from_frontend = payload.get("activity")  # 可选
+        activity_from_frontend = payload.get("activity")
 
         if (not acc or not isinstance(acc, list) or
                 not isinstance(acc[0], list) or len(acc[0]) != SOCIAL_INPUT_DIM):
@@ -606,7 +598,6 @@ def classify_social():
                 "error": "Bad JSON: expected accelerometer array shape [N, 3]. See /schema"
             }), 400
 
-        # 如果前端传了 activity，而且不是 static，可以直接拒绝（可选逻辑）
         if activity_from_frontend is not None and activity_from_frontend not in STATIC_ACTIVITIES:
             return jsonify({
                 "ok": False,
@@ -638,6 +629,5 @@ def classify_social():
         app.logger.exception(f"[EXCEPTION] classify_social() failed: {e}")
         return jsonify({"ok": False, "error": str(e)}), 500
 
-# ========= 程序入口 =========
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=5000, debug=True)
